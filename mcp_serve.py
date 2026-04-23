@@ -10,7 +10,8 @@ Matches OpenClaw's 9-tool MCP channel bridge surface:
   events_poll, events_wait, messages_send, permissions_list_open,
   permissions_respond
 
-Plus: channels_list (Hermes-specific extra)
+Plus: channels_list and the skill file helpers:
+  skill_list_files, skill_read_file
 
 Usage:
     hermes mcp serve
@@ -40,6 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import yaml
+
 logger = logging.getLogger("hermes.mcp_serve")
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,36 @@ def _get_sessions_dir() -> Path:
         return get_hermes_home() / "sessions"
     except ImportError:
         return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "sessions"
+
+
+def _get_hermes_home() -> Path:
+    """Return the Hermes home directory using the shared helper when available."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home()
+    except ImportError:
+        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+
+
+def _get_config_path() -> Path:
+    """Return the active config.yaml path."""
+    try:
+        from hermes_constants import get_config_path
+
+        return get_config_path()
+    except ImportError:
+        return _get_hermes_home() / "config.yaml"
+
+
+def _get_skills_root() -> Path:
+    """Return the Hermes skills root."""
+    try:
+        from hermes_constants import get_skills_dir
+
+        return get_skills_dir()
+    except ImportError:
+        return _get_hermes_home() / "skills"
 
 
 def _get_session_db():
@@ -97,13 +130,7 @@ def _load_sessions_index() -> dict:
 
 def _load_channel_directory() -> dict:
     """Load the cached channel directory for available targets."""
-    try:
-        from hermes_constants import get_hermes_home
-        directory_file = get_hermes_home() / "channel_directory.json"
-    except ImportError:
-        directory_file = Path(
-            os.environ.get("HERMES_HOME", Path.home() / ".hermes")
-        ) / "channel_directory.json"
+    directory_file = _get_hermes_home() / "channel_directory.json"
 
     if not directory_file.exists():
         return {}
@@ -163,6 +190,106 @@ def _extract_attachments(msg: dict) -> List[dict]:
             attachments.append({"type": "media", "path": path})
 
     return attachments
+
+
+def _load_mcp_config() -> dict:
+    """Load the local Hermes config, falling back to an empty config."""
+    config_path = _get_config_path()
+    if not config_path.exists():
+        return {}
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except Exception as exc:
+        logger.warning("Failed to load config.yaml for MCP server: %s", exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_allowed_send_targets() -> List[str]:
+    """Load the fail-closed send whitelist from config.yaml."""
+    config = _load_mcp_config()
+    mcp_config = config.get("mcp", {})
+    if not isinstance(mcp_config, dict):
+        return []
+    targets = mcp_config.get("allowed_send_targets", [])
+    if not isinstance(targets, list):
+        return []
+    return [target for target in targets if isinstance(target, str) and target]
+
+
+def _deny_messages_send(target: str) -> None:
+    """Emit the required audit line and raise a PermissionError."""
+    print(
+        f"[mcp.whitelist] DENY messages_send target={target} "
+        f"(not in allowed_send_targets)",
+        file=sys.stderr,
+    )
+    raise PermissionError(f"messages_send target not allowed: {target}")
+
+
+def _resolve_skill_dir(skill_name: str) -> Path:
+    """Resolve a skill directory under HERMES_HOME/skills without escape."""
+    if not skill_name:
+        raise ValueError("skill_name is required")
+    skill_path = Path(skill_name)
+    if skill_path.is_absolute():
+        raise ValueError("absolute skill_name paths are not allowed")
+
+    skills_root = _get_skills_root().resolve()
+    skill_dir = (skills_root / skill_name).resolve()
+    try:
+        skill_dir.relative_to(skills_root)
+    except ValueError as exc:
+        raise ValueError("skill_name escapes SKILLS_ROOT") from exc
+    return skill_dir
+
+
+def _resolve_skill_target(skill_name: str, file_path: str) -> tuple[Path, Path]:
+    """Resolve a file under one skill directory with strict path checks."""
+    if not file_path:
+        raise ValueError("file_path is required")
+    rel_path = Path(file_path)
+    if rel_path.is_absolute():
+        raise ValueError("absolute file_path paths are not allowed")
+
+    skill_dir = _resolve_skill_dir(skill_name)
+    raw_target = skill_dir / rel_path
+    target = raw_target.resolve()
+    try:
+        target.relative_to(skill_dir)
+    except ValueError as exc:
+        raise ValueError("file_path escapes skill_dir") from exc
+    return skill_dir, raw_target
+
+
+def _ensure_no_symlinks(skill_dir: Path, raw_target: Path) -> None:
+    """Reject any symlinked component below the skill directory."""
+    relative_parts = raw_target.relative_to(skill_dir).parts
+    current = skill_dir
+    for part in relative_parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("symlinks not allowed")
+
+
+def _list_skill_files(skill_dir: Path) -> List[str]:
+    """Return all regular files under the skill directory as relative paths."""
+    if not skill_dir.is_dir():
+        raise FileNotFoundError(str(skill_dir))
+
+    files: List[str] = []
+    for root, dirnames, filenames in os.walk(skill_dir, topdown=True, followlinks=False):
+        root_path = Path(root)
+        dirnames[:] = [
+            dirname for dirname in dirnames if not (root_path / dirname).is_symlink()
+        ]
+        for filename in filenames:
+            path = root_path / filename
+            if path.is_symlink() or not path.is_file():
+                continue
+            files.append(path.relative_to(skill_dir).as_posix())
+    return sorted(files)
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +825,51 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             return json.dumps({"event": event}, indent=2)
         return json.dumps({"event": None, "reason": "timeout"}, indent=2)
 
+    # -- skill_list_files --------------------------------------------------
+
+    @mcp.tool()
+    def skill_list_files(skill_name: str) -> str:
+        """List regular files under one skill directory.
+
+        Args:
+            skill_name: Name of the skill under HERMES_HOME/skills
+        """
+        skill_dir = _resolve_skill_dir(skill_name)
+        files = _list_skill_files(skill_dir)
+        return json.dumps(
+            {
+                "skill_name": skill_name,
+                "count": len(files),
+                "files": files,
+            },
+            indent=2,
+        )
+
+    # -- skill_read_file ---------------------------------------------------
+
+    @mcp.tool()
+    def skill_read_file(skill_name: str, file_path: str) -> str:
+        """Read one file from a skill directory with path confinement checks.
+
+        Args:
+            skill_name: Name of the skill under HERMES_HOME/skills
+            file_path: Relative path under that skill directory
+        """
+        skill_dir, raw_target = _resolve_skill_target(skill_name, file_path)
+        _ensure_no_symlinks(skill_dir, raw_target)
+        if not raw_target.exists():
+            raise FileNotFoundError(str(raw_target))
+        if not raw_target.is_file():
+            raise FileNotFoundError(str(raw_target))
+
+        data = raw_target.read_bytes()
+        size = len(data)
+        if size > 1_048_576:
+            raise ValueError(
+                f"file too large: {size} bytes > 1048576 bytes (1MB limit)"
+            )
+        return data.decode("utf-8", errors="replace")
+
     # -- messages_send -----------------------------------------------------
 
     @mcp.tool()
@@ -722,6 +894,10 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
         """
         if not target or not message:
             return json.dumps({"error": "Both target and message are required"})
+
+        allowed_targets = _load_allowed_send_targets()
+        if target not in allowed_targets:
+            _deny_messages_send(target)
 
         try:
             from tools.send_message_tool import send_message_tool

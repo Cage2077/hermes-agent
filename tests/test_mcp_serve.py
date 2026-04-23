@@ -18,6 +18,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.exceptions import ToolError
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +169,12 @@ def _create_test_db(db_path, session_id, messages):
     conn.close()
 
 
+def _write_config(tmp_path, text: str) -> Path:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(text, encoding="utf-8")
+    return config_path
+
+
 @pytest.fixture
 def mock_session_db(tmp_path, populated_sessions_dir):
     """Create a real SQLite DB with test messages and wire it up."""
@@ -245,6 +253,51 @@ class TestHelpers:
         import mcp_serve
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
         assert mcp_serve._load_sessions_index() == {}
+
+    def test_load_allowed_send_targets(self, tmp_path):
+        import mcp_serve
+
+        _write_config(
+            tmp_path,
+            'mcp:\n  allowed_send_targets:\n    - "discord:1483214969649500222"\n',
+        )
+        assert mcp_serve._load_allowed_send_targets() == [
+            "discord:1483214969649500222"
+        ]
+
+    def test_load_allowed_send_targets_fail_closed(self, tmp_path):
+        import mcp_serve
+
+        _write_config(tmp_path, "model:\n  provider: test\n")
+        assert mcp_serve._load_allowed_send_targets() == []
+
+
+class TestSkillHelpers:
+    def test_list_skill_files(self, tmp_path):
+        import mcp_serve
+
+        skill_dir = tmp_path / "skills" / "sample"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Sample\n", encoding="utf-8")
+        (skill_dir / "nested").mkdir()
+        (skill_dir / "nested" / "rules.txt").write_text("r1\n", encoding="utf-8")
+
+        files = mcp_serve._list_skill_files(skill_dir)
+        assert files == ["SKILL.md", "nested/rules.txt"]
+
+    def test_resolve_skill_target_rejects_parent_escape(self, tmp_path):
+        import mcp_serve
+
+        (tmp_path / "skills" / "sample").mkdir(parents=True)
+        with pytest.raises(ValueError, match="file_path escapes skill_dir"):
+            mcp_serve._resolve_skill_target("sample", "../secret.txt")
+
+    def test_resolve_skill_target_rejects_absolute_path(self, tmp_path):
+        import mcp_serve
+
+        (tmp_path / "skills" / "sample").mkdir(parents=True)
+        with pytest.raises(ValueError, match="absolute file_path"):
+            mcp_serve._resolve_skill_target("sample", "/tmp/secret.txt")
 
 
 class TestContentExtraction:
@@ -690,16 +743,122 @@ class TestE2EEventsWait:
         assert result["event"] is not None
 
 
+class TestE2ESkillFiles:
+    def test_skill_list_files(self, mcp_server_e2e, _event_loop, tmp_path):
+        server, _ = mcp_server_e2e
+        skill_dir = tmp_path / "skills" / "spx-gamma-exposure"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# SPX\n", encoding="utf-8")
+        (skill_dir / "rules").mkdir()
+        (skill_dir / "rules" / "R1.md").write_text("R1\n", encoding="utf-8")
+
+        result = _run_tool(
+            server,
+            "skill_list_files",
+            {"skill_name": "spx-gamma-exposure"},
+        )
+        assert result["count"] == 2
+        assert result["files"] == ["SKILL.md", "rules/R1.md"]
+
+    def test_skill_read_file(self, mcp_server_e2e, _event_loop, tmp_path):
+        server, _ = mcp_server_e2e
+        skill_dir = tmp_path / "skills" / "spx-gamma-exposure"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("R1\nR2\n", encoding="utf-8")
+
+        result = asyncio.get_event_loop().run_until_complete(
+            server._tool_manager.call_tool(
+                "skill_read_file",
+                {"skill_name": "spx-gamma-exposure", "file_path": "SKILL.md"},
+            )
+        )
+        assert result == "R1\nR2\n"
+
+    def test_skill_read_file_rejects_parent_escape(
+        self, mcp_server_e2e, _event_loop, tmp_path
+    ):
+        server, _ = mcp_server_e2e
+        (tmp_path / "skills" / "safe").mkdir(parents=True)
+        with pytest.raises(ToolError, match="file_path escapes skill_dir"):
+            _run_tool(
+                server,
+                "skill_read_file",
+                {"skill_name": "safe", "file_path": "../secret.txt"},
+            )
+
+    def test_skill_read_file_rejects_absolute_path(
+        self, mcp_server_e2e, _event_loop, tmp_path
+    ):
+        server, _ = mcp_server_e2e
+        (tmp_path / "skills" / "safe").mkdir(parents=True)
+        with pytest.raises(ToolError, match="absolute file_path"):
+            _run_tool(
+                server,
+                "skill_read_file",
+                {"skill_name": "safe", "file_path": "/tmp/secret.txt"},
+            )
+
+    def test_skill_read_file_rejects_symlink(
+        self, mcp_server_e2e, _event_loop, tmp_path
+    ):
+        server, _ = mcp_server_e2e
+        skill_dir = tmp_path / "skills" / "safe"
+        skill_dir.mkdir(parents=True)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret\n", encoding="utf-8")
+        (skill_dir / "link.txt").symlink_to(outside)
+
+        # Either path confinement (resolve() follows symlink outside skill_dir)
+        # or the explicit symlink check will trip — both are correct rejections.
+        with pytest.raises(ToolError, match="(symlinks not allowed|escapes skill_dir)"):
+            _run_tool(
+                server,
+                "skill_read_file",
+                {"skill_name": "safe", "file_path": "link.txt"},
+            )
+
+    def test_skill_read_file_missing(self, mcp_server_e2e, _event_loop, tmp_path):
+        server, _ = mcp_server_e2e
+        (tmp_path / "skills" / "safe").mkdir(parents=True)
+        with pytest.raises(ToolError):
+            _run_tool(
+                server,
+                "skill_read_file",
+                {"skill_name": "safe", "file_path": "missing.md"},
+            )
+
+    def test_skill_read_file_rejects_large_file(
+        self, mcp_server_e2e, _event_loop, tmp_path
+    ):
+        server, _ = mcp_server_e2e
+        skill_dir = tmp_path / "skills" / "safe"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "large.txt").write_bytes(b"x" * (1_048_576 + 1))
+
+        with pytest.raises(ToolError, match="file too large: 1048577 bytes"):
+            _run_tool(
+                server,
+                "skill_read_file",
+                {"skill_name": "safe", "file_path": "large.txt"},
+            )
+
+
 class TestE2EMessagesSend:
     def test_send_missing_args(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
         result = _run_tool(server, "messages_send", {"target": "", "message": "hi"})
         assert "error" in result
 
-    def test_send_delegates_to_tool(self, mcp_server_e2e, _event_loop, monkeypatch):
+    def test_send_delegates_to_tool(
+        self, mcp_server_e2e, _event_loop, monkeypatch, tmp_path
+    ):
         server, _ = mcp_server_e2e
         mock = MagicMock(return_value=json.dumps({"success": True, "platform": "telegram"}))
         monkeypatch.setattr("tools.send_message_tool.send_message_tool", mock)
+        _write_config(
+            tmp_path,
+            'mcp:\n  allowed_send_targets:\n    - "telegram:123456"\n',
+        )
 
         result = _run_tool(server, "messages_send",
                           {"target": "telegram:123456", "message": "Hello!"})
@@ -708,6 +867,47 @@ class TestE2EMessagesSend:
         call_args = mock.call_args[0][0]
         assert call_args["action"] == "send"
         assert call_args["target"] == "telegram:123456"
+
+    def test_send_rejects_target_outside_whitelist(
+        self, mcp_server_e2e, _event_loop, monkeypatch, tmp_path, capsys
+    ):
+        server, _ = mcp_server_e2e
+        mock = MagicMock(return_value=json.dumps({"success": True}))
+        monkeypatch.setattr("tools.send_message_tool.send_message_tool", mock)
+        _write_config(
+            tmp_path,
+            'mcp:\n  allowed_send_targets:\n    - "discord:1483214969649500222"\n',
+        )
+
+        with pytest.raises(ToolError, match="messages_send target not allowed"):
+            _run_tool(
+                server,
+                "messages_send",
+                {"target": "discord:999", "message": "blocked"},
+            )
+        mock.assert_not_called()
+        stderr = capsys.readouterr().err
+        assert (
+            "[mcp.whitelist] DENY messages_send target=discord:999 "
+            "(not in allowed_send_targets)"
+        ) in stderr
+
+    def test_send_missing_whitelist_denies_all(
+        self, mcp_server_e2e, _event_loop, monkeypatch, tmp_path, capsys
+    ):
+        server, _ = mcp_server_e2e
+        mock = MagicMock(return_value=json.dumps({"success": True}))
+        monkeypatch.setattr("tools.send_message_tool.send_message_tool", mock)
+        _write_config(tmp_path, "mcp:\n  other: true\n")
+
+        with pytest.raises(ToolError, match="messages_send target not allowed"):
+            _run_tool(
+                server,
+                "messages_send",
+                {"target": "telegram:123456", "message": "blocked"},
+            )
+        mock.assert_not_called()
+        assert "target=telegram:123456" in capsys.readouterr().err
 
 
 class TestE2EChannelsList:
@@ -793,7 +993,7 @@ class TestE2EPermissions:
 
 
 # ---------------------------------------------------------------------------
-# 4. TOOL LISTING — verify all 10 tools are registered
+# 4. TOOL LISTING — verify all 12 tools are registered
 # ---------------------------------------------------------------------------
 
 class TestToolRegistration:
@@ -805,6 +1005,7 @@ class TestToolRegistration:
         expected = {
             "conversations_list", "conversation_get", "messages_read",
             "attachments_fetch", "events_poll", "events_wait",
+            "skill_list_files", "skill_read_file",
             "messages_send", "channels_list",
             "permissions_list_open", "permissions_respond",
         }
